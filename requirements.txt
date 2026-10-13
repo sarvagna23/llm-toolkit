@@ -2,3 +2,4 @@ anthropic
 tiktoken
 pytest
 mypy
+printf "httpx\n" >> requirements.txt

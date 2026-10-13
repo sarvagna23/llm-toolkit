@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-
+import random
 import anthropic
 
 
@@ -10,27 +10,51 @@ class Completion:
     input_tokens: int
     output_tokens: int
     latency_ms: float
-
-
+RETRYABLE_ERRORS = (
+    anthropic.RateLimitError,        # 429: too many requests
+    anthropic.InternalServerError,   # 5xx: server trouble
+    anthropic.APIConnectionError,    # network problems, and timeouts
+)
+def backoff_delay(attempt: int, *, base: float = 1.0, cap: float = 30.0) -> float:
+    upper_limit = min(cap, base * (2 ** attempt))   # doubles each attempt, never above the cap
+    return random.uniform(0, upper_limit)           # a random wait up to that limit
 class LLMClient:
-    def __init__(self, model: str = "claude-sonnet-5-5"):
+    def __init__(
+        self,
+        model: str = "claude-sonnet-5-5",
+        *,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 3,
+    ):
         self.model = model
-        self._client = anthropic.Anthropic()    # reads ANTHROPIC_API_KEY from the environment
-
+        self.max_retries = max_retries
+        self._sleep = time.sleep      # kept on the object so a test can swap in a fake
+        self._client = anthropic.Anthropic(
+            max_retries=0,            # the SDK's own retries stay off
+            timeout=timeout_seconds,
+        )
     def complete(self, prompt: str, *, max_tokens: int = 300) -> Completion:
-        start_time = time.perf_counter()
+        attempt = 0
 
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        while True:
+            start_time = time.perf_counter()
+            try:
+                response = self._client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            except RETRYABLE_ERRORS:
+                if attempt >= self.max_retries:
+                    raise                                    # out of retries, so show the real error
+                self._sleep(backoff_delay(attempt))          # wait, then try again
+                attempt += 1
+                continue
 
-        latency_ms = (time.perf_counter() - start_time) * 1000
-
-        return Completion(
-            text=response.content[0].text,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            latency_ms=latency_ms,
-        )
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            return Completion(
+                text=response.content[0].text,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                latency_ms=latency_ms,
+            )
