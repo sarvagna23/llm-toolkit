@@ -1,14 +1,15 @@
+import asyncio
+from types import SimpleNamespace
+
 import anthropic
 import httpx
 import pytest
-import asyncio
-from client import AsyncLLMClient
 
-from client import backoff_delay
-from types import SimpleNamespace
+from cache import DiskCache
+from client import AsyncLLMClient, Completion, LLMClient, backoff_delay
 
-from client import Completion, LLMClient
 
+# ---------- fakes ----------
 
 class FakeMessages:
     def create(self, **kwargs):
@@ -23,19 +24,6 @@ class FakeAnthropic:
     def __init__(self):
         self.messages = FakeMessages()
 
-
-def test_complete_returns_completion(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")    # so LLMClient() can be created
-    client = LLMClient()
-    client._client = FakeAnthropic()                       # swap the real SDK for the fake
-
-    result = client.complete("hi", max_tokens=20)
-
-    assert isinstance(result, Completion)
-    assert result.text == "Hello from the fake"
-    assert result.input_tokens == 11
-    assert result.output_tokens == 4
-    assert result.latency_ms >= 0
 
 def make_status_error(error_class, status_code):
     request = httpx.Request("POST", "https://api.example.com/v1/messages")
@@ -67,6 +55,64 @@ def make_client(monkeypatch, errors, max_retries=3):
     client._sleep = sleeps.append     # records each wait and never really sleeps
     return client, messages, sleeps
 
+
+class SlowAsyncMessages:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+
+    async def create(self, **kwargs):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.01)
+        self.active -= 1
+        return SimpleNamespace(
+            content=[SimpleNamespace(text="ok")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+
+class CountingAsyncMessages:
+    def __init__(self):
+        self.calls = 0
+
+    async def create(self, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(
+            content=[SimpleNamespace(text="ok")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+
+class RecordingMessages:
+    def __init__(self):
+        self.last_kwargs = None
+
+    def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        return SimpleNamespace(
+            content=[SimpleNamespace(text="ok")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+
+# ---------- basic behavior ----------
+
+def test_complete_returns_completion(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = LLMClient()
+    client._client = FakeAnthropic()                       # swap the real SDK for the fake
+
+    result = client.complete("hi", max_tokens=20)
+
+    assert isinstance(result, Completion)
+    assert result.text == "Hello from the fake"
+    assert result.input_tokens == 11
+    assert result.output_tokens == 4
+    assert result.latency_ms >= 0
+
+
+# ---------- retries ----------
 
 def test_retries_then_succeeds(monkeypatch):
     errors = [make_status_error(anthropic.RateLimitError, 429) for _ in range(2)]
@@ -119,21 +165,8 @@ def test_backoff_delay_stays_in_bounds():
         for _ in range(200):
             assert 0 <= backoff_delay(attempt) <= limit
 
-class SlowAsyncMessages:
-    def __init__(self):
-        self.active = 0
-        self.max_active = 0
 
-    async def create(self, **kwargs):
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        await asyncio.sleep(0.01)
-        self.active -= 1
-        return SimpleNamespace(
-            content=[SimpleNamespace(text="ok")],
-            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
-        )
-
+# ---------- async client ----------
 
 def test_async_client_respects_max_concurrent(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -144,5 +177,70 @@ def test_async_client_respects_max_concurrent(monkeypatch):
     results = asyncio.run(client.complete_many([f"p{i}" for i in range(10)]))
 
     assert len(results) == 10
-    assert all(result.text == "ok" for result in results)
+    assert all(isinstance(result, Completion) and result.text == "ok" for result in results)
     assert messages.max_active == 3          # never more than 3 at once
+
+
+# ---------- cache ----------
+
+def test_cache_avoids_second_api_call(monkeypatch, tmp_path):
+    client, messages, sleeps = make_client(monkeypatch, errors=[])
+    client.cache = DiskCache(str(tmp_path))
+
+    first = client.complete("hi")
+    second = client.complete("hi")
+
+    assert messages.calls == 1
+    assert first.cached is False
+    assert second.cached is True
+    assert second.text == first.text
+    assert second.input_tokens == first.input_tokens
+
+
+def test_cache_misses_when_settings_differ(monkeypatch, tmp_path):
+    client, messages, sleeps = make_client(monkeypatch, errors=[])
+    client.cache = DiskCache(str(tmp_path))
+
+    client.complete("hi", max_tokens=10)
+    client.complete("hi", max_tokens=20)
+    client.complete("hi", max_tokens=10)    # repeat of the first call
+
+    assert messages.calls == 2
+
+
+def test_async_cache_avoids_second_api_call(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = AsyncLLMClient(cache=DiskCache(str(tmp_path)))
+    messages = CountingAsyncMessages()
+    client._client = SimpleNamespace(messages=messages)
+
+    async def run_twice():
+        first = await client.complete("hi")
+        second = await client.complete("hi")
+        return first, second
+
+    first, second = asyncio.run(run_twice())
+
+    assert messages.calls == 1
+    assert first.cached is False
+    assert second.cached is True
+    assert second.text == first.text
+
+
+# ---------- sampling settings ----------
+
+def test_temperature_and_top_p_are_sent_only_when_given(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = LLMClient()
+    messages = RecordingMessages()
+    client._client = SimpleNamespace(messages=messages)
+
+    client.complete("hi")
+    assert "temperature" not in messages.last_kwargs
+    assert "top_p" not in messages.last_kwargs
+
+    client.complete("hi", temperature=0)
+    assert messages.last_kwargs["temperature"] == 0
+
+    client.complete("hi", top_p=0.9)
+    assert messages.last_kwargs["top_p"] == 0.9

@@ -2,7 +2,5 @@ anthropic
 tiktoken
 pytest
 mypy
-printf "httpx\n" >> requirements.txt
+httpx
 numpy
-mypy
-pytest-asyncio

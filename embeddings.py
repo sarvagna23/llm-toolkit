@@ -8,6 +8,9 @@ def normalize(vectors: np.ndarray) -> np.ndarray:
 
 
 def top_k(query: np.ndarray, vectors: np.ndarray, k: int) -> list[tuple[int, float]]:
+    if k <= 0:
+        return []
+
     query = normalize(query)
     vectors = normalize(vectors)
 
