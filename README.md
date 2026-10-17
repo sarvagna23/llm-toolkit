@@ -52,6 +52,33 @@ cats.txt         -       -          -  FAILED
 ```
 (That sample shows a failed row, from a run with a rejected key.)
 
+## Example runs
+Two files from `docs/` (an empty third file is skipped). First run, nothing cached:
+```
+skipped (empty): empty.txt
+file            in     out       cost  status
+cats.txt        75      42    $0.0006  paid
+python.md       67      43    $0.0006  paid
+
+calls: 2 paid, 0 from cache, 0 failed
+tokens: 142 in, 85 out
+cost: $0.0011 (cache saved about $0.0000)
+results written to summaries.jsonl
+```
+Second run, same folder. Every answer comes from the cache, so there are no API calls and no cost:
+```
+skipped (empty): empty.txt
+file            in     out       cost  status
+cats.txt        75      42    $0.0000  cached
+python.md       67      43    $0.0000  cached
+
+calls: 0 paid, 2 from cache, 0 failed
+tokens: 0 in, 0 out
+cost: $0.0000 (cache saved about $0.0011)
+results written to summaries.jsonl
+```
+The amounts are small because the sample files are tiny.
+
 ## Tests
 ```
 pytest -v
