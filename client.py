@@ -1,10 +1,12 @@
+import asyncio
 import random
 import time
-import asyncio
 from dataclasses import dataclass
 from typing import Any
 
 import anthropic
+
+from cache import DiskCache, make_cache_key
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,7 @@ class Completion:
     input_tokens: int
     output_tokens: int
     latency_ms: float
+    cached: bool = False
 
 
 RETRYABLE_ERRORS = (
@@ -34,9 +37,11 @@ class LLMClient:
         *,
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
+        cache: DiskCache | None = None,
     ):
         self.model = model
         self.max_retries = max_retries
+        self.cache = cache
         self._sleep = time.sleep      # kept on the object so a test can swap in a fake
         self._client = anthropic.Anthropic(
             max_retries=0,            # the SDK's own retries stay off
@@ -61,6 +66,18 @@ class LLMClient:
         if top_p is not None:
             request["top_p"] = top_p
 
+        key = make_cache_key(request) if self.cache is not None else None
+        if self.cache is not None and key is not None:
+            saved = self.cache.get(key)
+            if saved is not None:
+                return Completion(
+                    text=saved["text"],
+                    input_tokens=saved["input_tokens"],
+                    output_tokens=saved["output_tokens"],
+                    latency_ms=0.0,
+                    cached=True,
+                )
+
         attempt = 0
         while True:
             start_time = time.perf_counter()
@@ -74,13 +91,21 @@ class LLMClient:
                 continue
 
             latency_ms = (time.perf_counter() - start_time) * 1000
-            return Completion(
+            completion = Completion(
                 text=response.content[0].text,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
                 latency_ms=latency_ms,
             )
-        
+            if self.cache is not None and key is not None:
+                self.cache.set(key, {
+                    "text": completion.text,
+                    "input_tokens": completion.input_tokens,
+                    "output_tokens": completion.output_tokens,
+                })
+            return completion
+
+
 class AsyncLLMClient:
     def __init__(
         self,
@@ -89,10 +114,12 @@ class AsyncLLMClient:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         max_concurrent: int = 5,
+        cache: DiskCache | None = None,
     ):
         self.model = model
         self.max_retries = max_retries
-        self._sleep = asyncio.sleep               # async sleep, so the loop can run other tasks while waiting
+        self.cache = cache
+        self._sleep = asyncio.sleep
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._client = anthropic.AsyncAnthropic(
             max_retries=0,
@@ -117,26 +144,45 @@ class AsyncLLMClient:
         if top_p is not None:
             request["top_p"] = top_p
 
+        key = make_cache_key(request) if self.cache is not None else None
+        if self.cache is not None and key is not None:
+            saved = self.cache.get(key)
+            if saved is not None:
+                return Completion(
+                    text=saved["text"],
+                    input_tokens=saved["input_tokens"],
+                    output_tokens=saved["output_tokens"],
+                    latency_ms=0.0,
+                    cached=True,
+                )
+
         attempt = 0
         while True:
             start_time = time.perf_counter()
             try:
-                async with self._semaphore:                       # take a permit for the call only
+                async with self._semaphore:
                     response = await self._client.messages.create(**request)
             except RETRYABLE_ERRORS:
                 if attempt >= self.max_retries:
                     raise
-                await self._sleep(backoff_delay(attempt))         # waiting happens OUTSIDE the permit
+                await self._sleep(backoff_delay(attempt))
                 attempt += 1
                 continue
 
             latency_ms = (time.perf_counter() - start_time) * 1000
-            return Completion(
+            completion = Completion(
                 text=response.content[0].text,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
                 latency_ms=latency_ms,
             )
+            if self.cache is not None and key is not None:
+                self.cache.set(key, {
+                    "text": completion.text,
+                    "input_tokens": completion.input_tokens,
+                    "output_tokens": completion.output_tokens,
+                })
+            return completion
 
     async def complete_many(self, prompts: list[str], **kwargs: Any) -> list[Completion | BaseException]:
         tasks = [self.complete(prompt, **kwargs) for prompt in prompts]
