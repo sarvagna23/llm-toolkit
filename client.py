@@ -1,6 +1,8 @@
+import random
 import time
 from dataclasses import dataclass
-import random
+from typing import Any
+
 import anthropic
 
 
@@ -10,14 +12,20 @@ class Completion:
     input_tokens: int
     output_tokens: int
     latency_ms: float
+
+
 RETRYABLE_ERRORS = (
     anthropic.RateLimitError,        # 429: too many requests
     anthropic.InternalServerError,   # 5xx: server trouble
     anthropic.APIConnectionError,    # network problems, and timeouts
 )
+
+
 def backoff_delay(attempt: int, *, base: float = 1.0, cap: float = 30.0) -> float:
     upper_limit = min(cap, base * (2 ** attempt))   # doubles each attempt, never above the cap
     return random.uniform(0, upper_limit)           # a random wait up to that limit
+
+
 class LLMClient:
     def __init__(
         self,
@@ -33,17 +41,30 @@ class LLMClient:
             max_retries=0,            # the SDK's own retries stay off
             timeout=timeout_seconds,
         )
-    def complete(self, prompt: str, *, max_tokens: int = 300) -> Completion:
-        attempt = 0
 
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 300,
+        temperature: float | None = None,
+        top_p: float | None = None,
+    ) -> Completion:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if temperature is not None:
+            request["temperature"] = temperature
+        if top_p is not None:
+            request["top_p"] = top_p
+
+        attempt = 0
         while True:
             start_time = time.perf_counter()
             try:
-                response = self._client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": prompt}],
-                )
+                response = self._client.messages.create(**request)
             except RETRYABLE_ERRORS:
                 if attempt >= self.max_retries:
                     raise                                    # out of retries, so show the real error

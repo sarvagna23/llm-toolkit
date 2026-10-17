@@ -3,3 +3,5 @@ tiktoken
 pytest
 mypy
 printf "httpx\n" >> requirements.txt
+numpy
+mypy
