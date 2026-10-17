@@ -1,6 +1,8 @@
 import anthropic
 import httpx
 import pytest
+import asyncio
+from client import AsyncLLMClient
 
 from client import backoff_delay
 from types import SimpleNamespace
@@ -116,3 +118,31 @@ def test_backoff_delay_stays_in_bounds():
         limit = min(30.0, 2 ** attempt)
         for _ in range(200):
             assert 0 <= backoff_delay(attempt) <= limit
+
+class SlowAsyncMessages:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+
+    async def create(self, **kwargs):
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.01)
+        self.active -= 1
+        return SimpleNamespace(
+            content=[SimpleNamespace(text="ok")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+
+def test_async_client_respects_max_concurrent(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    client = AsyncLLMClient(max_concurrent=3)
+    messages = SlowAsyncMessages()
+    client._client = SimpleNamespace(messages=messages)
+
+    results = asyncio.run(client.complete_many([f"p{i}" for i in range(10)]))
+
+    assert len(results) == 10
+    assert all(result.text == "ok" for result in results)
+    assert messages.max_active == 3          # never more than 3 at once

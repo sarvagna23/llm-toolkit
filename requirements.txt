@@ -5,3 +5,4 @@ mypy
 printf "httpx\n" >> requirements.txt
 numpy
 mypy
+pytest-asyncio
