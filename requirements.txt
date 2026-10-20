@@ -4,3 +4,4 @@ pytest
 mypy
 httpx
 numpy
+pydantic
