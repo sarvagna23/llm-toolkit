@@ -4,3 +4,4 @@ __pycache__/
 .demo_cache/
 .mypy_cache/
 .pytest_cache/summaries.jsonl
+summaries.jsonl
